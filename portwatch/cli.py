@@ -297,8 +297,7 @@ class PortWatch(App):
         
         # # check computer notification is enabled 
         # if not notification_is_enabled():
-        #     await self.push_screen(NotificationNotEnabledAlert())
-        
+        #     await self.push_screen(NotificationNotEnabledAlert())  
 
         if not self.table.columns:
             # define columns matching map_table output
