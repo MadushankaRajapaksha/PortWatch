@@ -1,4 +1,3 @@
-# file: portwatch_textual.py
 import asyncio
 import psutil
 from typing import List, Dict, Any, Optional
@@ -15,8 +14,8 @@ from pathlib import Path
 import yaml
 from .notifyer import alert_conflict,notification_is_enabled
 
-async def map_table(data_list: List[Dict[str, Any]], old_data: List[Dict[str, Any]],filter_mode):
-    from .utils import get_port_description  
+async def map_table(data_list: List[Dict[str, Any]], old_data: List[Dict[str, Any]], filter_mode: str):
+    from .utils import get_port_description
 
     table_data = []
     for item in data_list:
@@ -27,31 +26,56 @@ async def map_table(data_list: List[Dict[str, Any]], old_data: List[Dict[str, An
         action_label = "[red]KILL[/red]"
 
         note_parts = []
-        
+
+        # Precompute flags
+        is_new = item in await scan_changes(old_data, data_list)
+        is_conflict = bool(item.get("note"))
+
+                 
+        if is_conflict and is_new:
+            alert_conflict(port, app_name=process_name)
+
+        # Apply filter mode
         if filter_mode == "all":
-            if item in await scan_changes(old_data, data_list):
+            if is_new:
                 note_parts.append("[green]NEW[/green]")
-                if item.get("note"):
-                    alert_conflict(port,app_name=process_name)
- 
-            if item.get("note"):  
-                note_parts.append(f"[yellow]⚠ Conflict[/yellow]")
-                
-            note = " ".join(note_parts)
-            table_data.append((pid, port, process_name, status, action_label, note))
+            if is_conflict:
+                note_parts.append("[yellow]⚠ Conflict[/yellow]")
         elif filter_mode == "conflict":
-            if item.get("note"):  
-                note_parts.append(f"[yellow]⚠ Conflict[/yellow]")
-                note = " ".join(note_parts)
-                table_data.append((pid, port, process_name, status, action_label, note))
+            if not is_conflict:
+                continue
+            note_parts.append("[yellow]⚠ Conflict[/yellow]")
         elif filter_mode == "new":
-            if item in await scan_changes(old_data, data_list):
-                note_parts.append("[green]NEW[/green]")
-                note = " ".join(note_parts)
-                table_data.append((pid, port, process_name, status, action_label, note))   
-            
+            if not is_new:
+                continue
+            note_parts.append("[green]NEW[/green]")
+
+        note = " ".join(note_parts)
+        table_data.append((pid, port, process_name, status, action_label, note))
+
     return table_data
 
+
+def apply_text_filter(data_list: List[Dict[str, Any]], text_filter: Optional[str]) -> List[Dict[str, Any]]:
+    """Apply text filtering to the data list locally without re-scanning"""
+    if not text_filter:
+        return data_list
+    
+    text_filter = text_filter.lower()
+    filtered_data = []
+    
+    for item in data_list:
+        pid = str(item.get("pid", "")).lower()
+        port = str(item.get("port", "")).lower()
+        process_name = str(item.get("process_name", "")).lower()
+        
+        # Check if filter matches any field
+        if (text_filter in pid or 
+            text_filter in port or 
+            text_filter in process_name):
+            filtered_data.append(item)
+    
+    return filtered_data
 
 
 class KillConfirmation(ModalScreen[bool]):
@@ -195,7 +219,8 @@ class PortWatch(App):
         self.filter: Optional[str] = None
         self.conns: List[Dict[str, Any]] = []  
         self.filter_mode: str = "all"  # "all", "new", "conflict"
-         
+        self._last_refresh_data: List[Dict[str, Any]] = []  # Store last scan results
+        self._refresh_in_progress = False
         
         # self.dev_ports = _get_port_config()
         
@@ -212,7 +237,7 @@ class PortWatch(App):
                     placeholder="Filter processes or ports (e.g. Chrome, 3000)",
                     classes="filter_input"
                 )
-                yield Button("All", id="filter_all", classes="filter_btn")
+                yield Button("All", id="filter_all", classes="filter_btn filter_btn--active")
                 yield Button("🆕 New", id="filter_new", classes="filter_btn")
                 yield Button("⚠️ Conflict", id="filter_conflict", classes="filter_btn")
                 yield Button("⚙️ Config", id="open_config", variant="primary", classes="config_btn")
@@ -220,25 +245,28 @@ class PortWatch(App):
         yield Footer()
         
     
-    # hadle filter buttons 
+    # handle filter buttons with instant refresh
     
     @on(Button.Pressed, "#filter_all")
     def set_filter_all(self):
         self.filter_mode = "all"
         self.update_button_styles()
-        asyncio.create_task(self._do_refresh_once())
+        # Instant refresh using cached data
+        asyncio.create_task(self._refresh_display_instantly())
 
     @on(Button.Pressed, "#filter_new")
     def set_filter_new(self):
         self.filter_mode = "new"
         self.update_button_styles()
-        asyncio.create_task(self._do_refresh_once())
+        # Instant refresh using cached data
+        asyncio.create_task(self._refresh_display_instantly())
 
     @on(Button.Pressed, "#filter_conflict")
     def set_filter_conflict(self):
         self.filter_mode = "conflict"
         self.update_button_styles()
-        asyncio.create_task(self._do_refresh_once())
+        # Instant refresh using cached data
+        asyncio.create_task(self._refresh_display_instantly())
         
     def update_button_styles(self):
         """Highlight active filter button."""
@@ -260,40 +288,78 @@ class PortWatch(App):
     @on(Input.Changed)
     def input_changed(self, event: Input.Changed) -> None:
         self.filter = event.value.strip() or None
+        # Instant filtering using cached data
+        asyncio.create_task(self._refresh_display_instantly())
 
     async def on_ready(self) -> None:
         self.table = self.query_one("#port_table", DataTable)
         self.table.cursor_type = "row"
         
-        # cheack computer notificat is enebled 
-        if not notification_is_enabled():
-            await self.push_screen(NotificationNotEnabledAlert())
+        # # check computer notification is enabled 
+        # if not notification_is_enabled():
+        #     await self.push_screen(NotificationNotEnabledAlert())
         
 
         if not self.table.columns:
             # define columns matching map_table output
             self.table.add_columns("PID", "PORT", "PROCESS", "STATUS", "ACTION", "NOTE")
 
-        asyncio.create_task(self._refresh_loop())
+        # Initial scan and start background refresh
+        await self._do_data_scan()
+        asyncio.create_task(self._background_refresh_loop())
 
-    async def _refresh_loop(self) -> None:
+    async def _background_refresh_loop(self) -> None:
+        """Background loop that only scans for new data every 2 seconds"""
         while True:
-            await self._do_refresh_once()
-            await asyncio.sleep(2)
+            await asyncio.sleep(2)  # Reduced from 3 to 2 seconds
+            if not self._refresh_in_progress:
+                await self._do_data_scan()
 
-    async def _do_refresh_once(self) -> None:
+    async def _do_data_scan(self) -> None:
+        """Scan for new data and refresh display"""
         try:
-             
-            new_conns = await scan_ports(self.filter)
-
-            rows = await map_table(new_conns,self.conns,self.filter_mode)
+            self._refresh_in_progress = True
             
+            # Always scan without text filter to get complete data
+            new_conns = await scan_ports(None)
+            
+            # Update our data store
+            old_conns = self.conns.copy()
             self.conns = new_conns
+            self._last_refresh_data = new_conns
+            
+            # Refresh the display with current filters
+            await self._refresh_display_with_data(new_conns, old_conns)
+            
+            self.log(f"PortWatch: scanned {len(new_conns)} connections")
+        except Exception as e:
+            self.log(f"PortWatch error during scan: {e}")
+        finally:
+            self._refresh_in_progress = False
 
-            # preserve scroll
+    async def _refresh_display_instantly(self) -> None:
+        """Instantly refresh display using cached data without re-scanning"""
+        if not self._last_refresh_data:
+            return
+        
+        try:
+            await self._refresh_display_with_data(self._last_refresh_data, self.conns)
+        except Exception as e:
+            self.log(f"PortWatch error during instant refresh: {e}")
+
+    async def _refresh_display_with_data(self, new_data: List[Dict[str, Any]], old_data: List[Dict[str, Any]]) -> None:
+        """Refresh display using provided data"""
+        try:
+            # Apply text filter first
+            filtered_data = apply_text_filter(new_data, self.filter)
+            
+            # Generate table rows with current filter mode
+            rows = await map_table(filtered_data, old_data, self.filter_mode)
+
+            # Preserve scroll position
             old_scroll = getattr(self.table, "scroll_offset", None)
 
-            # clear and add rows
+            # Clear and add rows
             try:
                 self.table.clear()
             except Exception:
@@ -303,20 +369,21 @@ class PortWatch(App):
                         self.table.remove_rows(0, nrows)
                 except Exception:
                     pass
+                    
             if rows:
                 self.table.add_rows(rows)
 
-                # allow UI tick then restore scroll (safe)
-                await asyncio.sleep(0)
+                # Allow UI to update then restore scroll
+                await asyncio.sleep(0.01)  # Very small delay
                 if old_scroll:
                     try:
-                        self.table.scroll_to(y=old_scroll.y,x=old_scroll.x)
+                        self.table.scroll_to(y=old_scroll.y, x=old_scroll.x)
                     except Exception:
                         pass
 
-            self.log(f"PortWatch: refreshed {len(rows)} rows")
+            self.log(f"PortWatch: display refreshed with {len(rows)} filtered rows")
         except Exception as e:
-            self.log(f"PortWatch error during scan: {e}")
+            self.log(f"PortWatch error during display refresh: {e}")
 
     @on(DataTable.RowSelected)
     async def handle_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -352,7 +419,7 @@ class PortWatch(App):
         # If the modal performed the kill (returned True), refresh immediately
         if result is True:
             self.notify(f"Killed PID {pid}", severity="success")
-            await self._do_refresh_once()
+            await self._do_data_scan()  # Force immediate scan after kill
         elif result is False:
             self.notify("Kill cancelled", severity="info")
         else:
@@ -360,9 +427,6 @@ class PortWatch(App):
             self.notify("No action taken", severity="info")
             
             
-
- 
-
 
 class NotificationNotEnabledAlert(ModalScreen[None]): 
     CSS = """
@@ -410,9 +474,6 @@ class NotificationNotEnabledAlert(ModalScreen[None]):
         if event.key in ("enter", "escape", "space"):
             self.dismiss()
             event.stop()
-
-
-     
 
 
 def main():

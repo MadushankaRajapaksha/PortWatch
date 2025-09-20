@@ -32,7 +32,7 @@ pip install portwatch
 Or if installing from source:
 
 ```bash
-git clone https://github.com/yourusername/portwatch.git
+git clone https://github.com/MadushankaRajapaksha/portwatch
 cd portwatch
 pip install -e .
 ```

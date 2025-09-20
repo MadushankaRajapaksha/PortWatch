@@ -3,18 +3,38 @@ import winreg
 import subprocess
 
 import platform
+import asyncio
+import threading
 
 
 
-def alert_conflict(port,app_name):
-    notification.notify(
-        title="PortWatch Alert",
-        message=f"Port {port} is in use by {app_name}.",
-        app_name="PortWatch",
-        timeout=5  
+def alert_conflict_sync(port: str, app_name: str = ""):
+    """Blocking version — runs in thread."""
+    try:
+        notification.notify(
+            title=f"⚠️ Port {port} in use",
+            message=f"Dev port {port} is being used by {app_name or 'unknown process'}.",
+            app_name="PortWatch",
+            timeout=5
+        )
+    except Exception as e:
+        # Log or ignore — don't crash UI
+        print(f"[Notification Error] {e}")
+
+async def alert_conflict(port: str, app_name: str = ""):
+    """Async wrapper — runs in background thread."""
+    # Don’t await — fire and forget
+    asyncio.create_task(
+        asyncio.to_thread(alert_conflict_sync, port, app_name)
     )
     
 def _windows_notification_is_enebled():
+    """
+    cheack windows system notification is enebled
+
+    Returns:
+        bool : is enabled
+    """
     try:
         key = winreg.OpenKey(
             winreg.HKEY_CURRENT_USER,
@@ -26,6 +46,13 @@ def _windows_notification_is_enebled():
         return True 
     
 def _linux_notifications_enabled() -> bool:
+    """
+    cheack linux system notification is enebled
+
+    Returns:
+        bool : is enabled
+    """
+    
     try:
         out = subprocess.check_output(
             ["dbus-send", "--session", "--dest=org.freedesktop.Notifications",
@@ -38,6 +65,12 @@ def _linux_notifications_enabled() -> bool:
     
 
 def _macos_notifications_enabled() -> bool:
+    """
+    cheack macos system notification is enebled
+
+    Returns:
+        bool : is enabled
+    """
     try:
         out = subprocess.check_output(
             ["defaults", "-currentHost", "read", "com.apple.notificationcenterui", "doNotDisturb"],
