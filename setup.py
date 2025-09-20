@@ -2,7 +2,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="portwatch",
-    version="0.0.1",
+    version="0.0.2",
     description="A simple tool to monitor network ports and connections",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
