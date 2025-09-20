@@ -12,7 +12,7 @@ from textual.events import Key
 from .scaner import scan_ports,scan_changes, check_for_conflict
 from pathlib import Path
 import yaml
-from .notifyer import alert_conflict,notification_is_enabled
+from .notifyer import alert_conflict 
 
 async def map_table(data_list: List[Dict[str, Any]], old_data: List[Dict[str, Any]], filter_mode: str):
     from .utils import get_port_description
