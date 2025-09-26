@@ -11,7 +11,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="portwatch",
-    version="0.0.5",
+    version="0.0.6",
     author="Madushanaka Rajapaksha",
     author_email="madushanakarajapakshe999@gmail.com",
     description="A real-time TUI app to monitor, filter, and kill processes using dev ports — with conflict alerts and built-in config UI.",
@@ -49,7 +49,7 @@ setup(
         "Topic :: System :: Networking",
         "Topic :: Utilities",
     ],
-    python_requires=">=3.9",
+    python_requires=">=3.10",
     license="MIT",
     keywords="port monitor, dev tools, tui, terminal, process killer, port conflict",
     project_urls={

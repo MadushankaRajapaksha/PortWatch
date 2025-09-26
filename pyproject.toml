@@ -36,7 +36,10 @@ dev = [
     "black",
     "ruff",
     "pytest",
-    "textual-dev"
+    "textual-dev",
+    "win10toast",
+    "pywin32",
+    "pyyaml",
 ]
 
 [project.urls]

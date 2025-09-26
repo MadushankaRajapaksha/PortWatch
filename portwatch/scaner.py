@@ -2,9 +2,9 @@
 
 import asyncio
 import psutil
-from typing import List, Dict, Any
+from typing import Union, List, Dict, Any
 
-# ✅ Import from file_utils
+ 
 from .utils import load_dev_ports, get_port_description
 
 # No more global cache — load fresh on every scan (or cache in UI if needed)
