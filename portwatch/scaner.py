@@ -1,5 +1,3 @@
-# scanner.py - Cross-platform optimized network scanner
-
 import asyncio
 import psutil
 import platform
@@ -14,6 +12,73 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .utils import load_dev_ports, get_port_description
+
+# Cleanup function
+def cleanup_scanner():
+    """Cleanup scanner resources"""
+    global _scanner
+    if _scanner is not None:
+        _scanner.cleanup()
+        _scanner = None
+
+# Diagnostic functions for troubleshooting
+async def diagnose_scanner() -> Dict[str, Any]:
+    """Diagnose scanner capabilities and issues"""
+    scanner = get_scanner()
+    
+    diagnosis = {
+        'platform': platform.system(),
+        'platform_version': platform.release(),
+        'available_methods': [m.value for m in scanner.available_methods],
+        'tests': {}
+    }
+    
+    # Test each method
+    for method in scanner.available_methods:
+        test_result = {'available': True, 'error': None, 'result_count': 0}
+        
+        try:
+            results = await scanner._scan_with_method(method, None)
+            test_result['result_count'] = len(results)
+        except Exception as e:
+            test_result['available'] = False
+            test_result['error'] = str(e)
+        
+        diagnosis['tests'][method.value] = test_result
+    
+    # Check permissions
+    diagnosis['permissions'] = {
+        'can_read_proc_net': False,
+        'can_use_psutil': False,
+        'effective_uid': None
+    }
+    
+    try:
+        import os
+        diagnosis['permissions']['effective_uid'] = os.geteuid() if hasattr(os, 'geteuid') else 'N/A'
+        
+        # Check /proc/net access on Linux
+        if scanner.system == 'linux':
+            try:
+                with open('/proc/net/tcp', 'r') as f:
+                    f.read(100)
+                diagnosis['permissions']['can_read_proc_net'] = True
+            except:
+                pass
+        
+        # Check psutil
+        try:
+            psutil.net_connections()
+            diagnosis['permissions']['can_use_psutil'] = True
+        except:
+            pass
+            
+    except Exception as e:
+        diagnosis['permissions']['error'] = str(e)
+    
+    return diagnosis
+
+ 
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -177,31 +242,48 @@ class CrossPlatformScanner:
         connections = []
         
         try:
-            # Try different connection types based on platform
-            connection_types = ['inet']
-            if self.system == 'windows':
-                connection_types.extend(['inet4', 'inet6'])
+            # On Linux, psutil requires root for full connection info
+            # Try with 'all' first, then fall back to 'inet'
+            connection_types = ['all', 'inet', 'inet4', 'inet6', 'tcp', 'tcp4', 'tcp6']
             
             for conn_type in connection_types:
                 try:
+                    logger.debug(f"Trying psutil with kind='{conn_type}'")
+                    conns_found = 0
+                    
                     for conn in psutil.net_connections(kind=conn_type):
                         if not conn.laddr or not hasattr(conn.laddr, 'port'):
                             continue
                         
+                        # On Linux, only get LISTEN connections
+                        if self.system == 'linux' and hasattr(conn, 'status'):
+                            if conn.status != psutil.CONN_LISTEN:
+                                continue
+                        
                         connection_info = self._extract_psutil_info(conn)
                         if connection_info and self._matches_filter(connection_info, filter_str):
                             connections.append(connection_info)
-                            
-                except (psutil.AccessDenied, AttributeError) as e:
-                    logger.debug(f"psutil {conn_type} failed: {e}")
-                    continue
+                            conns_found += 1
                     
-                # If we got results, don't try other types
-                if connections:
-                    break
+                    logger.debug(f"psutil {conn_type} found {conns_found} connections")
+                    
+                    # If we got results, use them
+                    if connections:
+                        break
+                            
+                except (psutil.AccessDenied, AttributeError, PermissionError) as e:
+                    logger.debug(f"psutil {conn_type} not accessible: {e}")
+                    continue
+                except Exception as e:
+                    logger.debug(f"psutil {conn_type} error: {e}")
+                    continue
+            
+            if not connections:
+                # psutil failed completely, raise to try next method
+                raise PermissionError("psutil requires elevated permissions or is not working")
                     
         except Exception as e:
-            logger.error(f"psutil scan completely failed: {e}")
+            logger.error(f"psutil scan failed: {e}")
             raise
         
         return connections
@@ -253,15 +335,26 @@ class CrossPlatformScanner:
         try:
             if self.system == "windows":
                 cmd = ["netstat", "-ano", "-p", "TCP"]
-            else:  # Unix/Linux/macOS
-                cmd = ["netstat", "-tuln", "-p"] if self.system == "linux" else ["netstat", "-an", "-f", "inet"]
+            elif self.system == "linux":
+                # Linux: try with sudo first for better results, fallback to non-sudo
+                cmd = ["netstat", "-tulpn"]  # -p requires root but try anyway
+            else:  # macOS
+                cmd = ["netstat", "-an", "-f", "inet", "-p", "tcp"]
             
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             
+            # On Linux, netstat might fail without sudo, that's okay
             if result.returncode != 0:
-                raise subprocess.CalledProcessError(result.returncode, cmd)
+                logger.debug(f"netstat failed with code {result.returncode}, stderr: {result.stderr[:100]}")
+                # Try without -p flag for Linux
+                if self.system == "linux":
+                    cmd = ["netstat", "-tuln"]  # Without process info
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             
-            connections = self._parse_netstat_output(result.stdout, filter_str)
+            if result.stdout:
+                connections = self._parse_netstat_output(result.stdout, filter_str)
+            else:
+                raise subprocess.CalledProcessError(result.returncode, cmd)
             
         except Exception as e:
             logger.error(f"netstat scan failed: {e}")
@@ -340,11 +433,17 @@ class CrossPlatformScanner:
         connections = []
         
         try:
-            # ss with process info
-            cmd = ["ss", "-tulnp"]
+            # Try with process info first
+            cmd = ["ss", "-tulpn"]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             
-            if result.returncode != 0:
+            # If failed (likely permission issue), try without process info
+            if result.returncode != 0 or not result.stdout.strip():
+                logger.debug(f"ss with -p failed, trying without process info")
+                cmd = ["ss", "-tuln"]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            
+            if result.returncode != 0 and not result.stdout.strip():
                 raise subprocess.CalledProcessError(result.returncode, cmd)
             
             connections = self._parse_ss_output(result.stdout, filter_str)
@@ -358,21 +457,43 @@ class CrossPlatformScanner:
     def _parse_ss_output(self, output: str, filter_str: Optional[str]) -> List[ConnectionInfo]:
         """Parse ss command output"""
         connections = []
-        lines = output.strip().split('\n')[1:]  # Skip header
+        lines = output.strip().split('\n')
         
-        for line in lines:
+        # Skip header lines
+        start_index = 0
+        for i, line in enumerate(lines):
+            if any(header in line.lower() for header in ['netid', 'state', 'recv-q']):
+                start_index = i + 1
+                break
+        
+        for line in lines[start_index:]:
+            if not line.strip():
+                continue
+                
             try:
                 parts = line.split()
                 if len(parts) < 5:
                     continue
                 
-                protocol = parts[0].upper()
+                protocol = parts[0].upper() if parts[0] else "TCP"
                 status = parts[1] if len(parts) > 1 else "UNKNOWN"
-                local_addr = parts[4] if len(parts) > 4 else ""
+                
+                # Find local address (varies by format)
+                local_addr = ""
+                for i, part in enumerate(parts):
+                    if ':' in part and not part.startswith('['):
+                        local_addr = part
+                        break
+                
+                if not local_addr:
+                    continue
                 
                 # Extract port
                 if ':' in local_addr:
                     port_str = local_addr.split(':')[-1]
+                    # Handle asterisks
+                    if '*' in port_str:
+                        continue
                     try:
                         port = int(port_str)
                     except ValueError:
@@ -380,22 +501,129 @@ class CrossPlatformScanner:
                 else:
                     continue
                 
-                # Extract process info from last column
+                # Extract process info from last column (if available)
                 process_name = ""
                 pid = None
-                if len(parts) > 6:
-                    process_info = parts[-1]
-                    if 'pid=' in process_info:
-                        try:
-                            pid_part = process_info.split('pid=')[1].split(',')[0]
-                            pid = int(pid_part)
-                            
-                            # Extract process name
-                            if 'users:((' in process_info:
-                                name_part = process_info.split('users:((')[1].split(',')[0].strip('"')
-                                process_name = name_part
-                        except:
-                            pass
+                
+                # Look for process info in format: users:(("name",pid=123,fd=4))
+                process_col = ' '.join(parts[5:]) if len(parts) > 5 else ""
+                if 'users:' in process_col or 'pid=' in process_col:
+                    try:
+                        if 'pid=' in process_col:
+                            pid_match = process_col.split('pid=')[1].split(',')[0].split(')')[0]
+                            pid = int(pid_match)
+                        
+                        if '(("' in process_col:
+                            name_match = process_col.split('(("')[1].split('"')[0]
+                            process_name = name_match
+                    except Exception as e:
+                        logger.debug(f"Failed to parse process info from: {process_col} - {e}")
+                
+                connection_info = ConnectionInfo(
+                    pid=pid,
+                    port=port,
+                    process_name=process_name or "",
+                    status=status if status != "UNCONN" else "LISTEN",
+                    local_address=local_addr,
+                    protocol=protocol
+                )
+                
+                if self._matches_filter(connection_info, filter_str):
+                    connections.append(connection_info)
+                    
+            except Exception as e:
+                logger.debug(f"Failed to parse ss line: '{line}' - {e}")
+                continue
+        
+        return connections
+
+    def _scan_lsof(self, filter_str: Optional[str]) -> List[ConnectionInfo]:
+        """Scan using lsof command (Unix/Linux/macOS)"""
+        connections = []
+        
+        try:
+            # lsof with various filter options
+            # -i: network files
+            # -P: no port name conversion
+            # -n: no DNS resolution (faster)
+            # -sTCP:LISTEN: only LISTEN state for TCP
+            cmd = ["lsof", "-i", "-P", "-n"]
+            
+            # Add state filter if not already there (some systems might not support it)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            
+            # lsof might return non-zero but still have output
+            if not result.stdout.strip():
+                logger.warning(f"lsof returned no output, stderr: {result.stderr[:200]}")
+                if result.returncode != 0:
+                    raise subprocess.CalledProcessError(result.returncode, cmd)
+            
+            connections = self._parse_lsof_output(result.stdout, filter_str)
+            
+        except Exception as e:
+            logger.error(f"lsof scan failed: {e}")
+            raise
+        
+        return connections
+
+    def _parse_lsof_output(self, output: str, filter_str: Optional[str]) -> List[ConnectionInfo]:
+        """Parse lsof command output"""
+        connections = []
+        lines = output.strip().split('\n')
+        
+        # Skip header line
+        start_index = 0
+        for i, line in enumerate(lines):
+            if line.startswith('COMMAND'):
+                start_index = i + 1
+                break
+        
+        for line in lines[start_index:]:
+            if not line.strip():
+                continue
+                
+            try:
+                parts = line.split()
+                if len(parts) < 8:
+                    continue
+                
+                process_name = parts[0]
+                pid = int(parts[1])
+                
+                # Protocol is usually at index 7
+                protocol_col = parts[7] if len(parts) > 7 else ""
+                protocol = "TCP"
+                if "UDP" in protocol_col.upper():
+                    protocol = "UDP"
+                elif "TCP" in protocol_col.upper():
+                    protocol = "TCP"
+                
+                # Local address is usually at index 8
+                local_addr = parts[8] if len(parts) > 8 else ""
+                
+                # Status might be in the protocol field or separate
+                status = "LISTEN"
+                if "(" in protocol_col:
+                    status_match = protocol_col.split('(')[1].split(')')[0]
+                    status = status_match
+                
+                # Extract port from address format like "*:8080", "127.0.0.1:3000", or "[::1]:8080"
+                port = None
+                if ':' in local_addr:
+                    port_str = local_addr.split(':')[-1]
+                    # Remove any parentheses or other characters
+                    port_str = port_str.split('(')[0].strip()
+                    try:
+                        port = int(port_str)
+                    except ValueError:
+                        # Might be a service name, skip it
+                        continue
+                else:
+                    continue
+                
+                # Only include LISTEN connections
+                if status.upper() not in ['LISTEN', 'BOUND']:
+                    continue
                 
                 connection_info = ConnectionInfo(
                     pid=pid,
@@ -410,72 +638,7 @@ class CrossPlatformScanner:
                     connections.append(connection_info)
                     
             except Exception as e:
-                logger.debug(f"Failed to parse ss line: {line} - {e}")
-                continue
-        
-        return connections
-
-    def _scan_lsof(self, filter_str: Optional[str]) -> List[ConnectionInfo]:
-        """Scan using lsof command (Unix/Linux/macOS)"""
-        connections = []
-        
-        try:
-            cmd = ["lsof", "-i", "-P", "-n", "-sTCP:LISTEN,UDP:*"]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-            
-            if result.returncode != 0 and result.stderr:
-                # lsof might return non-zero but still have useful output
-                if not result.stdout.strip():
-                    raise subprocess.CalledProcessError(result.returncode, cmd)
-            
-            connections = self._parse_lsof_output(result.stdout, filter_str)
-            
-        except Exception as e:
-            logger.error(f"lsof scan failed: {e}")
-            raise
-        
-        return connections
-
-    def _parse_lsof_output(self, output: str, filter_str: Optional[str]) -> List[ConnectionInfo]:
-        """Parse lsof command output"""
-        connections = []
-        lines = output.strip().split('\n')[1:]  # Skip header
-        
-        for line in lines:
-            try:
-                parts = line.split()
-                if len(parts) < 9:
-                    continue
-                
-                process_name = parts[0]
-                pid = int(parts[1])
-                protocol = parts[7].upper() if len(parts) > 7 else "TCP"
-                local_addr = parts[8] if len(parts) > 8 else ""
-                
-                # Extract port from address format like "*:8080" or "127.0.0.1:3000"
-                if ':' in local_addr:
-                    port_str = local_addr.split(':')[-1]
-                    try:
-                        port = int(port_str)
-                    except ValueError:
-                        continue
-                else:
-                    continue
-                
-                connection_info = ConnectionInfo(
-                    pid=pid,
-                    port=port,
-                    process_name=process_name,
-                    status="LISTEN",
-                    local_address=local_addr,
-                    protocol=protocol
-                )
-                
-                if self._matches_filter(connection_info, filter_str):
-                    connections.append(connection_info)
-                    
-            except Exception as e:
-                logger.debug(f"Failed to parse lsof line: {line} - {e}")
+                logger.debug(f"Failed to parse lsof line: '{line}' - {e}")
                 continue
         
         return connections
@@ -610,46 +773,145 @@ class CrossPlatformScanner:
 
     async def _emergency_fallback_scan(self, filter_str: Optional[str]) -> List[ConnectionInfo]:
         """Emergency fallback when all other methods fail"""
-        logger.warning("Using emergency fallback scan method")
+        logger.warning("Using emergency fallback scan method - checking /proc/net on Linux")
         connections = []
         
         try:
-            # Try basic socket approach for common ports
-            common_ports = [22, 80, 443, 3000, 3001, 5000, 8000, 8080, 9000]
+            # Linux-specific: read /proc/net/tcp and /proc/net/tcp6
+            if self.system == 'linux':
+                connections.extend(await self._read_proc_net('tcp', filter_str))
+                connections.extend(await self._read_proc_net('tcp6', filter_str))
             
-            async def check_port(port: int) -> Optional[ConnectionInfo]:
-                try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(0.1)  # Very short timeout
-                    result = sock.connect_ex(('127.0.0.1', port))
-                    sock.close()
-                    
-                    if result == 0:  # Port is open
-                        return ConnectionInfo(
-                            pid=None,
-                            port=port,
-                            process_name="Unknown",
-                            status="LISTEN",
-                            local_address=f"127.0.0.1:{port}",
-                            protocol="TCP"
-                        )
-                except:
-                    pass
-                return None
-            
-            # Check ports concurrently
-            tasks = [check_port(port) for port in common_ports]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            for result in results:
-                if isinstance(result, ConnectionInfo):
-                    if not filter_str or self._matches_filter(result, filter_str):
-                        connections.append(result)
+            # If still no connections, try socket probing
+            if not connections:
+                logger.warning("Trying socket probing as last resort")
+                # Get dev ports and common ports
+                dev_ports = list(self._get_cached_dev_ports())
+                common_ports = [22, 80, 443, 3000, 3001, 3306, 5000, 5432, 8000, 8080, 9000, 27017]
+                all_ports = list(set(dev_ports + common_ports))
+                
+                async def check_port(port: int) -> Optional[ConnectionInfo]:
+                    try:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(0.1)
+                        result = sock.connect_ex(('127.0.0.1', port))
+                        sock.close()
+                        
+                        if result == 0:
+                            return ConnectionInfo(
+                                pid=None,
+                                port=port,
+                                process_name="Unknown",
+                                status="LISTEN",
+                                local_address=f"127.0.0.1:{port}",
+                                protocol="TCP"
+                            )
+                    except:
+                        pass
+                    return None
+                
+                # Check ports concurrently
+                tasks = [check_port(port) for port in all_ports]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                for result in results:
+                    if isinstance(result, ConnectionInfo):
+                        if not filter_str or self._matches_filter(result, filter_str):
+                            connections.append(result)
             
         except Exception as e:
             logger.error(f"Emergency fallback failed: {e}")
         
         return connections
+    
+    async def _read_proc_net(self, protocol: str, filter_str: Optional[str]) -> List[ConnectionInfo]:
+        """Read /proc/net/tcp or /proc/net/tcp6 directly (Linux only)"""
+        connections = []
+        
+        try:
+            proc_file = f"/proc/net/{protocol}"
+            with open(proc_file, 'r') as f:
+                lines = f.readlines()[1:]  # Skip header
+            
+            for line in lines:
+                try:
+                    parts = line.split()
+                    if len(parts) < 10:
+                        continue
+                    
+                    # Parse local address (format: "0100007F:1F90" = 127.0.0.1:8080)
+                    local_addr_hex = parts[1]
+                    if ':' not in local_addr_hex:
+                        continue
+                    
+                    addr_hex, port_hex = local_addr_hex.split(':')
+                    port = int(port_hex, 16)
+                    
+                    # Parse status (0A = LISTEN in hex)
+                    status_hex = parts[3]
+                    if status_hex != '0A':  # Only LISTEN connections
+                        continue
+                    
+                    # Try to get PID from /proc
+                    pid = None
+                    inode = parts[9]
+                    pid = self._find_pid_by_inode(inode)
+                    
+                    # Get process name if we have PID
+                    process_name = ""
+                    if pid:
+                        try:
+                            process = psutil.Process(pid)
+                            process_name = process.name()
+                        except:
+                            process_name = f"PID:{pid}"
+                    
+                    connection_info = ConnectionInfo(
+                        pid=pid,
+                        port=port,
+                        process_name=process_name,
+                        status="LISTEN",
+                        local_address=f"*:{port}",
+                        protocol="TCP" if protocol.startswith('tcp') else "UDP"
+                    )
+                    
+                    if not filter_str or self._matches_filter(connection_info, filter_str):
+                        connections.append(connection_info)
+                        
+                except Exception as e:
+                    logger.debug(f"Failed to parse /proc/net line: {line.strip()} - {e}")
+                    continue
+                    
+        except Exception as e:
+            logger.debug(f"Failed to read {proc_file}: {e}")
+        
+        return connections
+    
+    def _find_pid_by_inode(self, inode: str) -> Optional[int]:
+        """Find PID by socket inode (Linux)"""
+        try:
+            import os
+            import glob
+            
+            # Search /proc/*/fd/* for matching socket inode
+            for pid_dir in glob.glob('/proc/[0-9]*'):
+                try:
+                    pid = int(os.path.basename(pid_dir))
+                    fd_dir = os.path.join(pid_dir, 'fd')
+                    
+                    for fd in os.listdir(fd_dir):
+                        try:
+                            link = os.readlink(os.path.join(fd_dir, fd))
+                            if f'socket:[{inode}]' in link:
+                                return pid
+                        except (OSError, PermissionError):
+                            continue
+                except (ValueError, PermissionError, FileNotFoundError):
+                    continue
+        except Exception as e:
+            logger.debug(f"Failed to find PID for inode {inode}: {e}")
+        
+        return None
 
     def cleanup(self):
         """Cleanup scanner resources"""
