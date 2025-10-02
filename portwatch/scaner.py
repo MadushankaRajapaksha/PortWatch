@@ -1,3 +1,4 @@
+
 import asyncio
 import psutil
 import platform
@@ -12,73 +13,6 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .utils import load_dev_ports, get_port_description
-
-# Cleanup function
-def cleanup_scanner():
-    """Cleanup scanner resources"""
-    global _scanner
-    if _scanner is not None:
-        _scanner.cleanup()
-        _scanner = None
-
-# Diagnostic functions for troubleshooting
-async def diagnose_scanner() -> Dict[str, Any]:
-    """Diagnose scanner capabilities and issues"""
-    scanner = get_scanner()
-    
-    diagnosis = {
-        'platform': platform.system(),
-        'platform_version': platform.release(),
-        'available_methods': [m.value for m in scanner.available_methods],
-        'tests': {}
-    }
-    
-    # Test each method
-    for method in scanner.available_methods:
-        test_result = {'available': True, 'error': None, 'result_count': 0}
-        
-        try:
-            results = await scanner._scan_with_method(method, None)
-            test_result['result_count'] = len(results)
-        except Exception as e:
-            test_result['available'] = False
-            test_result['error'] = str(e)
-        
-        diagnosis['tests'][method.value] = test_result
-    
-    # Check permissions
-    diagnosis['permissions'] = {
-        'can_read_proc_net': False,
-        'can_use_psutil': False,
-        'effective_uid': None
-    }
-    
-    try:
-        import os
-        diagnosis['permissions']['effective_uid'] = os.geteuid() if hasattr(os, 'geteuid') else 'N/A'
-        
-        # Check /proc/net access on Linux
-        if scanner.system == 'linux':
-            try:
-                with open('/proc/net/tcp', 'r') as f:
-                    f.read(100)
-                diagnosis['permissions']['can_read_proc_net'] = True
-            except:
-                pass
-        
-        # Check psutil
-        try:
-            psutil.net_connections()
-            diagnosis['permissions']['can_use_psutil'] = True
-        except:
-            pass
-            
-    except Exception as e:
-        diagnosis['permissions']['error'] = str(e)
-    
-    return diagnosis
-
- 
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -124,31 +58,72 @@ class CrossPlatformScanner:
         """Detect available scanning methods for the current platform"""
         methods = []
         
-        # Test psutil first (most reliable)
-        try:
-            psutil.net_connections()
-            methods.append(ScanMethod.PSUTIL)
-        except (psutil.AccessDenied, AttributeError) as e:
-            logger.warning(f"psutil method not available: {e}")
-        
-        # Platform-specific methods
-        if self.system == "windows":
-            if self._test_command(["powershell", "-Command", "Get-NetTCPConnection | Select-Object -First 1"]):
-                methods.append(ScanMethod.POWERSHELL)
-            if self._test_command(["netstat", "-an"]):
-                methods.append(ScanMethod.NETSTAT)
-                
-        elif self.system in ["linux", "darwin"]:  # Linux or macOS
-            if self._test_command(["ss", "-tuln"]):
-                methods.append(ScanMethod.SS)
-            if self._test_command(["netstat", "-an"]):
-                methods.append(ScanMethod.NETSTAT)
+        # Platform-specific methods with correct priority
+        if self.system == "darwin":  # macOS
+            # macOS: lsof and netstat work best, psutil often fails
+            logger.info("Detecting macOS scanning methods...")
+            
             if self._test_command(["lsof", "-i", "-P", "-n"]):
                 methods.append(ScanMethod.LSOF)
+                logger.info("lsof is available")
+            
+            if self._test_command(["netstat", "-an", "-f", "inet"]):
+                methods.append(ScanMethod.NETSTAT)
+                logger.info("netstat is available")
+            
+            # Try psutil last on macOS
+            try:
+                psutil.net_connections(kind='inet')
+                methods.append(ScanMethod.PSUTIL)
+                logger.info("psutil is available")
+            except (psutil.AccessDenied, AttributeError, NotImplementedError) as e:
+                logger.warning(f"psutil not available on macOS: {e}")
+                
+        elif self.system == "linux":
+            # Linux: try ss, netstat, lsof, then psutil
+            logger.info("Detecting Linux scanning methods...")
+            
+            if self._test_command(["ss", "-tuln"]):
+                methods.append(ScanMethod.SS)
+                logger.info("ss is available")
+            
+            if self._test_command(["netstat", "-tuln"]):
+                methods.append(ScanMethod.NETSTAT)
+                logger.info("netstat is available")
+            
+            if self._test_command(["lsof", "-i", "-P", "-n"]):
+                methods.append(ScanMethod.LSOF)
+                logger.info("lsof is available")
+            
+            try:
+                psutil.net_connections(kind='inet')
+                methods.append(ScanMethod.PSUTIL)
+                logger.info("psutil is available")
+            except (psutil.AccessDenied, AttributeError) as e:
+                logger.warning(f"psutil not available: {e}")
+                
+        elif self.system == "windows":
+            # Windows: psutil works best, then PowerShell, then netstat
+            logger.info("Detecting Windows scanning methods...")
+            
+            try:
+                psutil.net_connections()
+                methods.append(ScanMethod.PSUTIL)
+                logger.info("psutil is available")
+            except (psutil.AccessDenied, AttributeError) as e:
+                logger.warning(f"psutil not available: {e}")
+            
+            if self._test_command(["powershell", "-Command", "Get-NetTCPConnection | Select-Object -First 1"]):
+                methods.append(ScanMethod.POWERSHELL)
+                logger.info("PowerShell is available")
+            
+            if self._test_command(["netstat", "-ano"]):
+                methods.append(ScanMethod.NETSTAT)
+                logger.info("netstat is available")
         
         if not methods:
-            logger.warning("No scanning methods available - will attempt basic psutil")
-            methods.append(ScanMethod.PSUTIL)  # Fallback even if it might fail
+            logger.warning("No scanning methods available - will attempt emergency fallback")
+            # Don't add PSUTIL here, let emergency fallback handle it
             
         return methods
 
@@ -374,27 +349,60 @@ class CrossPlatformScanner:
                     continue
                 
                 # Skip header lines
-                if any(header in line.lower() for header in ['proto', 'active', 'local', 'foreign']):
+                if any(header in line.lower() for header in ['proto', 'active', 'local', 'foreign', 'recv-q', 'send-q']):
                     continue
                 
                 protocol = parts[0].upper()
-                if protocol not in ['TCP', 'UDP']:
+                if protocol not in ['TCP', 'TCP4', 'TCP6', 'UDP', 'UDP4', 'UDP6']:
                     continue
                 
-                local_addr = parts[1] if len(parts) > 1 else ""
-                status = parts[3] if len(parts) > 3 else "UNKNOWN"
+                # Normalize protocol name
+                if protocol.startswith('TCP'):
+                    protocol = 'TCP'
+                elif protocol.startswith('UDP'):
+                    protocol = 'UDP'
+                
+                # Parse differently for macOS vs Linux/Windows
+                if self.system == "darwin":  # macOS format
+                    # macOS netstat format: Proto Recv-Q Send-Q Local-Address Foreign-Address (state)
+                    local_addr = parts[3] if len(parts) > 3 else ""
+                    status = parts[5] if len(parts) > 5 else "UNKNOWN"
+                else:  # Linux/Windows format
+                    local_addr = parts[1] if len(parts) > 1 else ""
+                    status = parts[3] if len(parts) > 3 else "UNKNOWN"
                 
                 # Extract port from address
-                if ':' in local_addr:
+                if not local_addr:
+                    continue
+                    
+                # Handle different address formats: 
+                # "127.0.0.1.8080" (macOS) or "127.0.0.1:8080" (Linux/Windows)
+                # "*.*" or "*:*" (any address)
+                port = None
+                if '.' in local_addr and ':' not in local_addr:
+                    # macOS format: IP.PORT
+                    parts_addr = local_addr.rsplit('.', 1)
+                    if len(parts_addr) == 2:
+                        try:
+                            port = int(parts_addr[1])
+                        except ValueError:
+                            continue
+                elif ':' in local_addr:
+                    # Standard format: IP:PORT or [IPv6]:PORT
                     port_str = local_addr.split(':')[-1]
                     try:
                         port = int(port_str)
                     except ValueError:
                         continue
-                else:
+                
+                if not port:
                     continue
                 
-                # Extract PID (Windows includes it, Unix might not)
+                # Only include LISTEN connections
+                if status.upper() not in ['LISTEN', 'LISTENING', 'BOUND']:
+                    continue
+                
+                # Extract PID if available (Windows includes it)
                 pid = None
                 if len(parts) > 4 and self.system == "windows":
                     try:
@@ -405,7 +413,7 @@ class CrossPlatformScanner:
                 connection_info = ConnectionInfo(
                     pid=pid,
                     port=port,
-                    process_name="",  # Will be filled later if we have PID
+                    process_name="",
                     status=status,
                     local_address=local_addr,
                     protocol=protocol
@@ -423,7 +431,7 @@ class CrossPlatformScanner:
                     connections.append(connection_info)
                     
             except Exception as e:
-                logger.debug(f"Failed to parse netstat line: {line} - {e}")
+                logger.debug(f"Failed to parse netstat line: '{line}' - {e}")
                 continue
         
         return connections
@@ -567,62 +575,103 @@ class CrossPlatformScanner:
         return connections
 
     def _parse_lsof_output(self, output: str, filter_str: Optional[str]) -> List[ConnectionInfo]:
-        """Parse lsof command output"""
+        """Parse lsof command output - works on macOS, Linux, BSD"""
         connections = []
         lines = output.strip().split('\n')
         
-        # Skip header line
-        start_index = 0
+        # Find header line to determine column positions
+        header_index = -1
         for i, line in enumerate(lines):
-            if line.startswith('COMMAND'):
-                start_index = i + 1
+            if 'COMMAND' in line and 'PID' in line:
+                header_index = i
                 break
+        
+        if header_index == -1:
+            logger.warning("Could not find lsof header line")
+            start_index = 0
+        else:
+            start_index = header_index + 1
         
         for line in lines[start_index:]:
             if not line.strip():
                 continue
-                
+            
             try:
-                parts = line.split()
-                if len(parts) < 8:
+                # lsof output varies, but generally:
+                # COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+                parts = line.split(None, 8)  # Split on whitespace, max 9 parts
+                
+                if len(parts) < 9:
                     continue
                 
                 process_name = parts[0]
-                pid = int(parts[1])
                 
-                # Protocol is usually at index 7
-                protocol_col = parts[7] if len(parts) > 7 else ""
-                protocol = "TCP"
-                if "UDP" in protocol_col.upper():
-                    protocol = "UDP"
-                elif "TCP" in protocol_col.upper():
-                    protocol = "TCP"
-                
-                # Local address is usually at index 8
-                local_addr = parts[8] if len(parts) > 8 else ""
-                
-                # Status might be in the protocol field or separate
-                status = "LISTEN"
-                if "(" in protocol_col:
-                    status_match = protocol_col.split('(')[1].split(')')[0]
-                    status = status_match
-                
-                # Extract port from address format like "*:8080", "127.0.0.1:3000", or "[::1]:8080"
-                port = None
-                if ':' in local_addr:
-                    port_str = local_addr.split(':')[-1]
-                    # Remove any parentheses or other characters
-                    port_str = port_str.split('(')[0].strip()
-                    try:
-                        port = int(port_str)
-                    except ValueError:
-                        # Might be a service name, skip it
-                        continue
-                else:
+                try:
+                    pid = int(parts[1])
+                except ValueError:
                     continue
                 
-                # Only include LISTEN connections
-                if status.upper() not in ['LISTEN', 'BOUND']:
+                # The NAME field (last column) contains the connection info
+                name_field = parts[8]
+                
+                # NAME format examples:
+                # "*:8080 (LISTEN)"
+                # "localhost:3000 (LISTEN)"
+                # "127.0.0.1:8080->192.168.1.1:54321 (ESTABLISHED)"
+                # "[::1]:8080 (LISTEN)"
+                
+                # Extract protocol from TYPE field (parts[4])
+                protocol = "TCP"
+                type_field = parts[4] if len(parts) > 4 else ""
+                if "UDP" in type_field.upper():
+                    protocol = "UDP"
+                elif "TCP" in type_field.upper() or "IPv" in type_field:
+                    protocol = "TCP"
+                
+                # Parse the NAME field for port and status
+                status = "UNKNOWN"
+                if "(LISTEN)" in name_field:
+                    status = "LISTEN"
+                elif "(ESTABLISHED)" in name_field:
+                    status = "ESTABLISHED"
+                elif "(BOUND)" in name_field:
+                    status = "LISTEN"
+                
+                # Only process LISTEN connections
+                if status != "LISTEN":
+                    continue
+                
+                # Extract local address (before "->")
+                local_addr = name_field.split('->')[0].split('(')[0].strip()
+                
+                # Extract port from various formats
+                port = None
+                
+                # Try IPv6 format first: [::1]:8080
+                if local_addr.startswith('['):
+                    try:
+                        port_part = local_addr.split(']:')[-1]
+                        port = int(port_part)
+                    except (ValueError, IndexError):
+                        pass
+                # Try IPv4/hostname format: *:8080 or localhost:8080 or 127.0.0.1:8080
+                elif ':' in local_addr:
+                    try:
+                        port_part = local_addr.split(':')[-1]
+                        port = int(port_part)
+                    except ValueError:
+                        pass
+                # Try macOS alternative format: *.8080
+                elif '.' in local_addr and local_addr.count('.') <= 4:
+                    try:
+                        parts_addr = local_addr.rsplit('.', 1)
+                        if len(parts_addr) == 2:
+                            port = int(parts_addr[1])
+                    except ValueError:
+                        pass
+                
+                if not port:
+                    logger.debug(f"Could not extract port from lsof line: {name_field}")
                     continue
                 
                 connection_info = ConnectionInfo(
@@ -641,6 +690,7 @@ class CrossPlatformScanner:
                 logger.debug(f"Failed to parse lsof line: '{line}' - {e}")
                 continue
         
+        logger.info(f"lsof parsed {len(connections)} connections")
         return connections
 
     def _scan_powershell(self, filter_str: Optional[str]) -> List[ConnectionInfo]:
@@ -996,3 +1046,190 @@ def cleanup_scanner():
     if _scanner is not None:
         _scanner.cleanup()
         _scanner = None
+        
+        
+        
+#####
+# Cleanup function
+def cleanup_scanner():
+    """Cleanup scanner resources"""
+    global _scanner
+    if _scanner is not None:
+        _scanner.cleanup()
+        _scanner = None
+
+# Diagnostic functions for troubleshooting
+async def diagnose_scanner() -> Dict[str, Any]:
+    """Diagnose scanner capabilities and issues"""
+    scanner = get_scanner()
+    
+    diagnosis = {
+        'platform': platform.system(),
+        'platform_version': platform.release(),
+        'python_version': platform.python_version(),
+        'available_methods': [m.value for m in scanner.available_methods],
+        'tests': {}
+    }
+    
+    # Test each method
+    for method in scanner.available_methods:
+        test_result = {'available': True, 'error': None, 'result_count': 0}
+        
+        try:
+            results = await scanner._scan_with_method(method, None)
+            test_result['result_count'] = len(results)
+            if results:
+                test_result['sample_ports'] = [r.port for r in results[:5]]
+        except Exception as e:
+            test_result['available'] = False
+            test_result['error'] = str(e)[:200]
+        
+        diagnosis['tests'][method.value] = test_result
+    
+    # Check permissions
+    diagnosis['permissions'] = {
+        'can_read_proc_net': False,
+        'can_use_psutil': False,
+        'effective_uid': None,
+        'is_root': False
+    }
+    
+    try:
+        import os
+        if hasattr(os, 'geteuid'):
+            uid = os.geteuid()
+            diagnosis['permissions']['effective_uid'] = uid
+            diagnosis['permissions']['is_root'] = (uid == 0)
+        
+        # Check /proc/net access on Linux
+        if scanner.system == 'linux':
+            try:
+                with open('/proc/net/tcp', 'r') as f:
+                    f.read(100)
+                diagnosis['permissions']['can_read_proc_net'] = True
+            except:
+                pass
+        
+        # Check psutil
+        try:
+            conns = psutil.net_connections(kind='inet')
+            diagnosis['permissions']['can_use_psutil'] = True
+            diagnosis['permissions']['psutil_connection_count'] = len(conns)
+        except Exception as e:
+            diagnosis['permissions']['psutil_error'] = str(e)[:200]
+            
+    except Exception as e:
+        diagnosis['permissions']['error'] = str(e)
+    
+    # Check command availability
+    diagnosis['commands'] = {}
+    commands_to_test = {
+        'lsof': ['lsof', '-v'],
+        'netstat': ['netstat', '--version'],
+        'ss': ['ss', '--version']
+    }
+    
+    for cmd_name, cmd in commands_to_test.items():
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=2)
+            diagnosis['commands'][cmd_name] = {
+                'available': result.returncode == 0 or result.stdout or result.stderr,
+                'path': subprocess.run(['which', cmd[0]], capture_output=True, text=True).stdout.strip()
+            }
+        except:
+            diagnosis['commands'][cmd_name] = {'available': False}
+    
+    return diagnosis
+
+async def test_scan_verbose() -> None:
+    """Run a verbose test scan with detailed logging"""
+    print("\n" + "="*60)
+    print("     PortWatch Scanner Diagnostic")
+    print("="*60 + "\n")
+    
+    # Run diagnosis
+    diag = await diagnose_scanner()
+    
+    print(f"Platform: {diag['platform']} {diag['platform_version']}")
+    print(f"Python: {diag['python_version']}")
+    print(f"Available Methods: {', '.join(diag['available_methods']) if diag['available_methods'] else 'NONE'}\n")
+    
+    print("Method Test Results:")
+    print("-" * 60)
+    for method, result in diag['tests'].items():
+        status = "✓ PASS" if result['available'] else "✗ FAIL"
+        count = f"({result['result_count']} connections)" if result['available'] else ""
+        print(f"  {method:15} {status:10} {count}")
+        if result.get('error'):
+            print(f"                Error: {result['error'][:80]}")
+        if result.get('sample_ports'):
+            print(f"                Sample ports: {result['sample_ports']}")
+    
+    print("\nPermissions:")
+    print("-" * 60)
+    perms = diag['permissions']
+    print(f"  UID: {perms.get('effective_uid', 'N/A')}")
+    print(f"  Root/Admin: {perms.get('is_root', False)}")
+    print(f"  psutil works: {perms.get('can_use_psutil', False)}")
+    if perms.get('psutil_error'):
+        print(f"    psutil error: {perms['psutil_error'][:80]}")
+    print(f"  /proc/net readable: {perms.get('can_read_proc_net', False)}")
+    
+    print("\nCommand Availability:")
+    print("-" * 60)
+    for cmd, info in diag.get('commands', {}).items():
+        status = "✓" if info.get('available') else "✗"
+        path = info.get('path', 'not found')
+        print(f"  {cmd:10} {status}  {path}")
+    
+    print("\n" + "="*60)
+    print("Running actual port scan...")
+    print("="*60 + "\n")
+    
+    try:
+        scanner = get_scanner()
+        results = await scanner.scan_ports()
+        
+        if results:
+            print(f"✓ Scan successful! Found {len(results)} listening ports:\n")
+            for conn in sorted(results, key=lambda x: x['port'])[:20]:
+                port = conn['port']
+                proc = conn.get('process_name', 'Unknown')[:30]
+                pid = conn.get('pid', 'N/A')
+                status = conn.get('status', 'N/A')
+                print(f"  Port {port:5}  PID: {str(pid):8}  Status: {status:10}  Process: {proc}")
+            
+            if len(results) > 20:
+                print(f"\n  ... and {len(results) - 20} more")
+        else:
+            print("✗ Scan returned no results")
+            print("\nTroubleshooting suggestions:")
+            if diag['platform'] == 'Darwin':
+                print("  macOS: Try running with 'sudo' for full process information")
+                print("  Ensure Terminal/app has 'Full Disk Access' in System Preferences")
+            elif diag['platform'] == 'Linux':
+                print("  Linux: Try running with 'sudo' for full connection details")
+                print("  Or use: sudo setcap cap_net_raw,cap_net_admin+eip /path/to/python")
+            print("  Check that at least one method (lsof, netstat, ss) is available")
+            
+    except Exception as e:
+        print(f"✗ Scan failed with error:\n  {e}")
+        import traceback
+        print("\nFull traceback:")
+        traceback.print_exc()
+    
+    print("\n" + "="*60 + "\n")
+
+# Add this convenience function to the module
+async def quick_test():
+    """Quick test of scanner functionality"""
+    try:
+        results = await scan_ports()
+        print(f"Scanner working! Found {len(results)} listening ports")
+        if results:
+            for r in results[:5]:
+                print(f"  Port {r['port']}: {r.get('process_name', 'Unknown')}")
+        return True
+    except Exception as e:
+        print(f"Scanner failed: {e}")
+        return False# scanner.py - Cross-platform optimized network scanner
