@@ -321,30 +321,30 @@ class CrossPlatformScanner:
                     if result.stdout:
                         connections.extend(self._parse_netstat_output(result.stdout, filter_str))
             elif self.system == "linux":
-                # Linux: try with sudo first for better results, fallback to non-sudo
+                # Linux: try with process info first, then without
                 cmd = ["netstat", "-tulpn"]  # -p requires root but try anyway
-            else:  # macOS
-                cmd = ["netstat", "-an", "-f", "inet", "-p", "tcp"]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            
-            # On Linux, netstat might fail without sudo, that's okay
-            if result.returncode != 0:
-                logger.debug(f"netstat failed with code {result.returncode}, stderr: {result.stderr[:100]}")
-                # Try without -p flag for Linux
-                if self.system == "linux":
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+
+                # On Linux, netstat might fail without sudo, that's okay
+                if result.returncode != 0:
+                    logger.debug(f"netstat with -p failed, trying without process info")
                     cmd = ["netstat", "-tuln"]  # Without process info
                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            
-            if result.stdout:
-                connections = self._parse_netstat_output(result.stdout, filter_str)
-            else:
-                raise subprocess.CalledProcessError(result.returncode, cmd)
-            
+
+                if result.stdout:
+                    connections.extend(self._parse_netstat_output(result.stdout, filter_str))
+            else:  # macOS
+                # macOS: scan both TCP and UDP
+                for proto in ["tcp", "udp"]:
+                    cmd = ["netstat", "-an", "-f", "inet", "-p", proto]
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                    if result.stdout:
+                        connections.extend(self._parse_netstat_output(result.stdout, filter_str))
+
         except Exception as e:
             logger.error(f"netstat scan failed: {e}")
             raise
-        
+
         return connections
 
     def _parse_netstat_output(self, output: str, filter_str: Optional[str]) -> List[ConnectionInfo]:
