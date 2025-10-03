@@ -215,52 +215,57 @@ class CrossPlatformScanner:
     def _scan_psutil(self, filter_str: Optional[str]) -> List[ConnectionInfo]:
         """Scan using psutil with enhanced error handling"""
         connections = []
-        
+
         try:
             # On Linux, psutil requires root for full connection info
             # Try with 'all' first, then fall back to 'inet'
-            connection_types = ['all', 'inet', 'inet4', 'inet6', 'tcp', 'tcp4', 'tcp6']
-            
+            connection_types = ['all', 'inet', 'inet4', 'inet6', 'tcp', 'tcp4', 'tcp6', 'udp', 'udp4', 'udp6']
+
             for conn_type in connection_types:
                 try:
                     logger.debug(f"Trying psutil with kind='{conn_type}'")
                     conns_found = 0
-                    
+
                     for conn in psutil.net_connections(kind=conn_type):
                         if not conn.laddr or not hasattr(conn.laddr, 'port'):
                             continue
-                        
-                        # On Linux, only get LISTEN connections
+
+                        # Include all connection states, not just LISTEN
+                        # This captures ESTABLISHED, TIME_WAIT, etc.
                         if self.system == 'linux' and hasattr(conn, 'status'):
-                            if conn.status != psutil.CONN_LISTEN:
+                            # On Linux, include LISTEN and ESTABLISHED connections
+                            if conn.status not in [psutil.CONN_LISTEN, psutil.CONN_ESTABLISHED]:
                                 continue
-                        
+                        elif self.system == 'windows' and hasattr(conn, 'status'):
+                            # On Windows, include LISTEN connections
+                            if conn.status not in [psutil.CONN_LISTEN]:
+                                continue
+
                         connection_info = self._extract_psutil_info(conn)
                         if connection_info and self._matches_filter(connection_info, filter_str):
                             connections.append(connection_info)
                             conns_found += 1
-                    
+
                     logger.debug(f"psutil {conn_type} found {conns_found} connections")
-                    
-                    # If we got results, use them
-                    if connections:
-                        break
-                            
+
+                    # If we got results, continue to check other types too
+                    # Don't break early - we want to capture all connection types
+
                 except (psutil.AccessDenied, AttributeError, PermissionError) as e:
                     logger.debug(f"psutil {conn_type} not accessible: {e}")
                     continue
                 except Exception as e:
                     logger.debug(f"psutil {conn_type} error: {e}")
                     continue
-            
+
             if not connections:
                 # psutil failed completely, raise to try next method
                 raise PermissionError("psutil requires elevated permissions or is not working")
-                    
+
         except Exception as e:
             logger.error(f"psutil scan failed: {e}")
             raise
-        
+
         return connections
 
     def _extract_psutil_info(self, conn) -> Optional[ConnectionInfo]:
@@ -309,7 +314,12 @@ class CrossPlatformScanner:
         
         try:
             if self.system == "windows":
-                cmd = ["netstat", "-ano", "-p", "TCP"]
+                # Windows: scan both TCP and UDP
+                for proto in ["TCP", "UDP"]:
+                    cmd = ["netstat", "-ano", "-p", proto]
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                    if result.stdout:
+                        connections.extend(self._parse_netstat_output(result.stdout, filter_str))
             elif self.system == "linux":
                 # Linux: try with sudo first for better results, fallback to non-sudo
                 cmd = ["netstat", "-tulpn"]  # -p requires root but try anyway
@@ -398,8 +408,9 @@ class CrossPlatformScanner:
                 if not port:
                     continue
                 
-                # Only include LISTEN connections
-                if status.upper() not in ['LISTEN', 'LISTENING', 'BOUND']:
+                # Include more connection states, not just LISTEN
+                # This captures LISTEN, ESTABLISHED, TIME_WAIT, etc.
+                if status.upper() not in ['LISTEN', 'LISTENING', 'BOUND', 'ESTABLISHED', 'TIME_WAIT']:
                     continue
                 
                 # Extract PID if available (Windows includes it)
@@ -637,8 +648,9 @@ class CrossPlatformScanner:
                 elif "(BOUND)" in name_field:
                     status = "LISTEN"
                 
-                # Only process LISTEN connections
-                if status != "LISTEN":
+                # Include more connection states, not just LISTEN
+                # This captures LISTEN, ESTABLISHED, TIME_WAIT, etc.
+                if status not in ["LISTEN", "ESTABLISHED", "TIME_WAIT"]:
                     continue
                 
                 # Extract local address (before "->")
@@ -781,17 +793,17 @@ class CrossPlatformScanner:
     async def _process_scan_results(self, connections: List[ConnectionInfo], filter_str: Optional[str]) -> List[Dict[str, Any]]:
         """Process and convert scan results to expected format"""
         results = []
-        
+
         for conn in connections:
             # Skip invalid connections
             if not conn.port or conn.port <= 0:
                 continue
-            
+
             # Add conflict detection note
             note = ""
             if self.check_for_conflict(conn.port):
                 note = get_port_description(conn.port)
-            
+
             result = {
                 "pid": conn.pid,
                 "port": conn.port,
@@ -801,24 +813,28 @@ class CrossPlatformScanner:
                 "protocol": getattr(conn, 'protocol', 'TCP'),
                 "local_address": getattr(conn, 'local_address', f"*:{conn.port}")
             }
-            
+
             # Add enhanced info if available
             if hasattr(conn, 'process_path') and conn.process_path:
                 result["process_path"] = conn.process_path
             if hasattr(conn, 'process_cmdline') and conn.process_cmdline:
                 result["process_cmdline"] = conn.process_cmdline
-            
+
             results.append(result)
-        
-        # Remove duplicates based on port+pid combination
+
+        # Remove duplicates based on port+pid+status combination to preserve different connection states
         unique_results = []
         seen = set()
         for result in results:
-            key = (result["port"], result.get("pid"))
+            key = (result["port"], result.get("pid"), result.get("status", ""))
             if key not in seen:
                 seen.add(key)
                 unique_results.append(result)
-        
+
+        # Sort by port number for consistent display
+        unique_results.sort(key=lambda x: (x["port"], x.get("status", ""), x.get("pid") or 0))
+
+        logger.debug(f"Processed {len(unique_results)} unique connections from {len(connections)} raw connections")
         return unique_results
 
     async def _emergency_fallback_scan(self, filter_str: Optional[str]) -> List[ConnectionInfo]:
