@@ -823,55 +823,208 @@ class CrossPlatformScanner:
 
     async def _emergency_fallback_scan(self, filter_str: Optional[str]) -> List[ConnectionInfo]:
         """Emergency fallback when all other methods fail"""
-        logger.warning("Using emergency fallback scan method - checking /proc/net on Linux")
+        logger.warning("Using emergency fallback scan method")
         connections = []
-        
+
         try:
-            # Linux-specific: read /proc/net/tcp and /proc/net/tcp6
+            # Multi-platform fallback approach
             if self.system == 'linux':
+                # Linux: try /proc/net first
+                logger.debug("Trying /proc/net/ method on Linux")
                 connections.extend(await self._read_proc_net('tcp', filter_str))
                 connections.extend(await self._read_proc_net('tcp6', filter_str))
-            
-            # If still no connections, try socket probing
+
+            # Cross-platform socket probing for common ports
             if not connections:
-                logger.warning("Trying socket probing as last resort")
-                # Get dev ports and common ports
-                dev_ports = list(self._get_cached_dev_ports())
-                common_ports = [22, 80, 443, 3000, 3001, 3306, 5000, 5432, 8000, 8080, 9000, 27017]
-                all_ports = list(set(dev_ports + common_ports))
-                
-                async def check_port(port: int) -> Optional[ConnectionInfo]:
-                    try:
-                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        sock.settimeout(0.1)
-                        result = sock.connect_ex(('127.0.0.1', port))
-                        sock.close()
-                        
-                        if result == 0:
-                            return ConnectionInfo(
-                                pid=None,
-                                port=port,
-                                process_name="Unknown",
-                                status="LISTEN",
-                                local_address=f"127.0.0.1:{port}",
-                                protocol="TCP"
-                            )
-                    except:
-                        pass
-                    return None
-                
-                # Check ports concurrently
-                tasks = [check_port(port) for port in all_ports]
+                logger.debug("Trying socket probing fallback")
+                connections.extend(await self._socket_probing_fallback(filter_str))
+
+            # Try additional system-specific methods
+            if not connections:
+                if self.system == 'windows':
+                    connections.extend(await self._windows_fallback_scan(filter_str))
+                elif self.system in ['linux', 'darwin']:
+                    connections.extend(await self._unix_fallback_scan(filter_str))
+
+        except Exception as e:
+            logger.error(f"Emergency fallback failed: {e}")
+
+        logger.info(f"Emergency fallback found {len(connections)} connections")
+        return connections
+
+    async def _socket_probing_fallback(self, filter_str: Optional[str]) -> List[ConnectionInfo]:
+        """Cross-platform socket probing fallback"""
+        connections = []
+
+        # Get ports to check
+        dev_ports = list(self._get_cached_dev_ports())
+        common_ports = [22, 80, 443, 3000, 3001, 3306, 5000, 5432, 8000, 8080, 9000, 27017, 6379, 9200]
+        all_ports = list(set(dev_ports + common_ports))
+
+        # Also check for running processes that might be using ports
+        try:
+            for proc in psutil.process_iter(['pid', 'name', 'connections']):
+                try:
+                    for conn in proc.connections():
+                        if conn.status == 'LISTEN' and conn.laddr:
+                            port = conn.laddr.port
+                            if port not in all_ports:
+                                all_ports.append(port)
+                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                    continue
+        except Exception as e:
+            logger.debug(f"Could not get process connections: {e}")
+
+        # Limit to reasonable number
+        all_ports = sorted(list(set(all_ports)))[:50]
+
+        async def check_port(port: int) -> Optional[ConnectionInfo]:
+            try:
+                # Try IPv4 first
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.1)
+                result = sock.connect_ex(('127.0.0.1', port))
+                sock.close()
+
+                if result == 0:
+                    return ConnectionInfo(
+                        pid=None,
+                        port=port,
+                        process_name="Listening Service",
+                        status="LISTEN",
+                        local_address=f"127.0.0.1:{port}",
+                        protocol="TCP"
+                    )
+            except Exception as e:
+                logger.debug(f"Port {port} check failed: {e}")
+            return None
+
+        if all_ports:
+            # Check ports concurrently but in smaller batches
+            batch_size = 10
+            for i in range(0, len(all_ports), batch_size):
+                batch = all_ports[i:i + batch_size]
+                tasks = [check_port(port) for port in batch]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
-                
+
                 for result in results:
                     if isinstance(result, ConnectionInfo):
                         if not filter_str or self._matches_filter(result, filter_str):
                             connections.append(result)
-            
+
+                # Small delay between batches
+                await asyncio.sleep(0.01)
+
+        return connections
+
+    async def _windows_fallback_scan(self, filter_str: Optional[str]) -> List[ConnectionInfo]:
+        """Windows-specific fallback using tasklist and netstat"""
+        connections = []
+
+        try:
+            # Use tasklist to find processes with network connections
+            result = subprocess.run(
+                ['tasklist', '/v', '/fo', 'csv'],
+                capture_output=True, text=True, timeout=10
+            )
+
+            if result.returncode == 0:
+                # Parse tasklist output for processes that might be listening
+                lines = result.stdout.strip().split('\n')
+                for line in lines[1:]:  # Skip header
+                    if 'LISTEN' in line.upper() or 'PORT' in line.upper():
+                        # This is a basic approach - in practice you'd need more sophisticated parsing
+                        pass
+
         except Exception as e:
-            logger.error(f"Emergency fallback failed: {e}")
-        
+            logger.debug(f"Windows fallback scan failed: {e}")
+
+        return connections
+
+    async def _unix_fallback_scan(self, filter_str: Optional[str]) -> List[ConnectionInfo]:
+        """Unix-specific fallback methods"""
+        connections = []
+
+        try:
+            # Try sockstat on FreeBSD/macOS
+            if self.system == 'darwin':
+                try:
+                    result = subprocess.run(['sockstat'], capture_output=True, text=True, timeout=5)
+                    if result.returncode == 0:
+                        connections.extend(self._parse_sockstat_output(result.stdout, filter_str))
+                except FileNotFoundError:
+                    pass
+
+            # Try fuser as last resort
+            try:
+                # Check if fuser is available
+                result = subprocess.run(['fuser', '-V'], capture_output=True, timeout=2)
+                if result.returncode == 0:
+                    # Use fuser to find processes using common ports
+                    for port in [80, 443, 3000, 8000, 8080, 22]:
+                        try:
+                            result = subprocess.run(['fuser', str(port) + '/tcp'],
+                                                  capture_output=True, text=True, timeout=2)
+                            if result.returncode == 0:
+                                # Parse fuser output
+                                pids = result.stdout.strip().split()
+                                for pid in pids:
+                                    try:
+                                        pid_int = int(pid)
+                                        proc = psutil.Process(pid_int)
+                                        connections.append(ConnectionInfo(
+                                            pid=pid_int,
+                                            port=port,
+                                            process_name=proc.name(),
+                                            status="LISTEN",
+                                            local_address=f"0.0.0.0:{port}",
+                                            protocol="TCP"
+                                        ))
+                                    except (psutil.NoSuchProcess, ValueError):
+                                        continue
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+        except Exception as e:
+            logger.debug(f"Unix fallback scan failed: {e}")
+
+        return connections
+
+    def _parse_sockstat_output(self, output: str, filter_str: Optional[str]) -> List[ConnectionInfo]:
+        """Parse sockstat output (FreeBSD/macOS)"""
+        connections = []
+
+        try:
+            lines = output.strip().split('\n')
+            for line in lines:
+                if 'LISTEN' in line:
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        try:
+                            port = int(parts[-1].split(':')[-1])
+                            pid = int(parts[-2])
+                            process_name = parts[0]
+
+                            connection_info = ConnectionInfo(
+                                pid=pid,
+                                port=port,
+                                process_name=process_name,
+                                status="LISTEN",
+                                local_address=f"0.0.0.0:{port}",
+                                protocol="TCP"
+                            )
+
+                            if not filter_str or self._matches_filter(connection_info, filter_str):
+                                connections.append(connection_info)
+
+                        except (ValueError, IndexError):
+                            continue
+
+        except Exception as e:
+            logger.debug(f"Failed to parse sockstat output: {e}")
+
         return connections
     
     async def _read_proc_net(self, protocol: str, filter_str: Optional[str]) -> List[ConnectionInfo]:

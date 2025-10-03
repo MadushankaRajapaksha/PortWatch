@@ -603,12 +603,48 @@ class NotificationNotEnabledAlert(ModalScreen[None]):
 
 
 def main():
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "diagnose":
+        # Run diagnostic mode
+        asyncio.run(run_diagnostics())
+        return
+
     app = PortWatch()
     try:
         app.run()
     finally:
         # Clean up thread pool
         THREAD_POOL.shutdown(wait=True)
+
+
+async def run_diagnostics():
+    """Run scanner diagnostics"""
+    from .scaner import test_scan_verbose, diagnose_scanner
+
+    print("🔍 PortWatch Scanner Diagnostics")
+    print("=" * 50)
+
+    try:
+        # Run basic diagnosis first
+        diag = await diagnose_scanner()
+        print(f"Platform: {diag['platform']} {diag['platform_version']}")
+        print(f"Available Methods: {', '.join(diag['available_methods']) if diag['available_methods'] else 'NONE'}")
+
+        if not diag['available_methods']:
+            print("\n❌ No scanning methods available!")
+            print("\nTroubleshooting steps:")
+            print("1. On Linux/macOS, try running with 'sudo portwatch diagnose'")
+            print("2. Install missing system tools: lsof, netstat, ss")
+            print("3. Check if psutil can access network connections")
+            return
+
+        # Run detailed test scan
+        await test_scan_verbose()
+
+    except Exception as e:
+        print(f"❌ Diagnostics failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
